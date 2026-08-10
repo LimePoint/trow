@@ -44,6 +44,7 @@ impl GcService {
 
         let mut space_reclaimed = 0;
         space_reclaimed += self.delete_stale_uploads().await?;
+        self.delete_untagged_manifests().await?;
         space_reclaimed += self.delete_orphan_blobs().await?;
         if let Some(space_required) = space_to_reclaim {
             space_reclaimed += self
@@ -92,6 +93,46 @@ impl GcService {
             )
         }
         Ok(bytes_reclaimed)
+    }
+
+    /// Deletes manifests nothing worth keeping refers to, unpinning their blobs for
+    /// `delete_orphan_blobs`.
+    ///
+    /// Returns the number of manifests deleted, not bytes: a manifest holds no storage of its own,
+    /// and the space its layers were pinning is attributed to `delete_orphan_blobs`.
+    ///
+    /// Runs to a fixpoint: an index is only collectable once nothing it lists is left, so deleting
+    /// the children of an orphaned multi-arch image is what makes the index itself collectable on
+    /// the next pass. Each pass deletes at least one row from a finite table, so this terminates;
+    /// `MAX_PASSES` is only a guard against a delete that somehow fails to remove its row.
+    pub async fn delete_untagged_manifests(&self) -> Result<u64, Error> {
+        const MAX_PASSES: usize = 16;
+        const RETENTION_SECS: i64 = 7 * 86_400;
+
+        let mut deleted = 0;
+        let mut settled = false;
+        for _ in 0..MAX_PASSES {
+            let pass_deleted = self
+                .repos
+                .manifest
+                .delete_untagged_older_than(RETENTION_SECS)
+                .await?;
+            // A pass that deletes nothing is the fixpoint. Checking the *outcome* rather than the
+            // pass number keeps a run that happens to finish on the last pass from being reported
+            // as a failure to settle.
+            if pass_deleted == 0 {
+                settled = true;
+                break;
+            }
+            deleted += pass_deleted;
+        }
+        if !settled {
+            tracing::warn!("Untagged manifest collection did not settle in {MAX_PASSES} passes");
+        }
+        if deleted > 0 {
+            tracing::info!(deleted, "Deleted untagged manifests");
+        }
+        Ok(deleted)
     }
 
     pub async fn delete_orphan_blobs(&self) -> Result<usize, Error> {
@@ -333,5 +374,325 @@ mod tests {
             uploads.is_empty(),
             "upload created but never written to was not collected"
         );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_delete_untagged_manifests() {
+        let dir = test_temp_dir!();
+        let (state, _router) = test_utilities::trow_router(|_| {}, &dir).await;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO blob (digest, size, last_accessed)
+            VALUES ('sha256:cfg_tagged', 10, strftime('%s', 'now', '-30 days')),
+                   ('sha256:cfg_untagged', 10, strftime('%s', 'now', '-30 days')),
+                   ('sha256:cfg_warm', 10, strftime('%s', 'now', '-1 hour')),
+                   ('sha256:layer', 500, strftime('%s', 'now', '-30 days'))
+            "#
+        )
+        .execute(state.services.repos().db_rw())
+        .await
+        .unwrap();
+
+        let tagged =
+            r#"{"config":{"digest":"sha256:cfg_tagged"},"layers":[{"digest":"sha256:layer"}]}"#
+                .as_bytes();
+        let untagged =
+            r#"{"config":{"digest":"sha256:cfg_untagged"},"layers":[{"digest":"sha256:layer"}]}"#
+                .as_bytes();
+        let warm =
+            r#"{"config":{"digest":"sha256:cfg_warm"},"layers":[{"digest":"sha256:layer"}]}"#
+                .as_bytes();
+
+        for (digest, json) in [
+            ("sha256:m_tagged", tagged),
+            ("sha256:m_untagged", untagged),
+            ("sha256:m_warm", warm),
+        ] {
+            sqlx::query!(
+                r#"INSERT INTO manifest (digest, blob, json) VALUES ($1, $2, jsonb($2))"#,
+                digest,
+                json
+            )
+            .execute(state.services.repos().db_rw())
+            .await
+            .unwrap();
+        }
+
+        sqlx::query!(
+            r#"
+            INSERT INTO tag (tag, repo, manifest_digest)
+            VALUES ('latest', 'testrepo', 'sha256:m_tagged')
+            "#
+        )
+        .execute(state.services.repos().db_rw())
+        .await
+        .unwrap();
+
+        let result = state.services.gc.delete_untagged_manifests().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 1);
+
+        let manifests = sqlx::query_scalar!(r#"SELECT digest FROM manifest"#)
+            .fetch_all(state.services.repos().db_ro())
+            .await
+            .unwrap();
+        assert_eq!(manifests.len(), 2);
+        assert!(manifests.contains(&"sha256:m_tagged".to_string()));
+        assert!(manifests.contains(&"sha256:m_warm".to_string()));
+
+        let assocs = sqlx::query_scalar!(
+            r#"SELECT manifest_digest FROM manifest_blob_assoc WHERE manifest_digest = 'sha256:m_untagged'"#
+        )
+        .fetch_all(state.services.repos().db_ro())
+        .await
+        .unwrap();
+        assert!(assocs.is_empty(), "manifest_blob_assoc was not cascaded");
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_delete_untagged_manifests_keeps_index_children() {
+        let dir = test_temp_dir!();
+        let (state, _router) = test_utilities::trow_router(|_| {}, &dir).await;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO blob (digest, size, last_accessed)
+            VALUES ('sha256:cfg_child', 10, strftime('%s', 'now', '-30 days')),
+                   ('sha256:layer', 500, strftime('%s', 'now', '-30 days'))
+            "#
+        )
+        .execute(state.services.repos().db_rw())
+        .await
+        .unwrap();
+
+        let child =
+            r#"{"config":{"digest":"sha256:cfg_child"},"layers":[{"digest":"sha256:layer"}]}"#
+                .as_bytes();
+        let index = r#"{"manifests":[{"digest":"sha256:m_child"}]}"#.as_bytes();
+
+        for (digest, json) in [("sha256:m_child", child), ("sha256:m_index", index)] {
+            sqlx::query!(
+                r#"INSERT INTO manifest (digest, blob, json) VALUES ($1, $2, jsonb($2))"#,
+                digest,
+                json
+            )
+            .execute(state.services.repos().db_rw())
+            .await
+            .unwrap();
+        }
+
+        sqlx::query!(
+            r#"
+            INSERT INTO tag (tag, repo, manifest_digest)
+            VALUES ('latest', 'testrepo', 'sha256:m_index')
+            "#
+        )
+        .execute(state.services.repos().db_rw())
+        .await
+        .unwrap();
+
+        let result = state.services.gc.delete_untagged_manifests().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0, "index child was collected");
+
+        let manifests = sqlx::query_scalar!(r#"SELECT digest FROM manifest"#)
+            .fetch_all(state.services.repos().db_ro())
+            .await
+            .unwrap();
+        assert_eq!(manifests.len(), 2);
+    }
+
+    /// OCI 1.1 referrers (signatures, SBOMs, attestations) are pushed by digest and are untagged
+    /// by design, so tag-only reachability would reclaim every artifact attached to a live image.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_delete_untagged_manifests_keeps_referrers_of_tagged_image() {
+        let dir = test_temp_dir!();
+        let (state, _router) = test_utilities::trow_router(|_| {}, &dir).await;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO blob (digest, size, last_accessed)
+            VALUES ('sha256:cfg_image', 10, strftime('%s', 'now', '-30 days')),
+                   ('sha256:cfg_sig', 10, strftime('%s', 'now', '-30 days')),
+                   ('sha256:cfg_orphan_sig', 10, strftime('%s', 'now', '-30 days'))
+            "#
+        )
+        .execute(state.services.repos().db_rw())
+        .await
+        .unwrap();
+
+        let image = r#"{"config":{"digest":"sha256:cfg_image"}}"#.as_bytes();
+        // Attached to the tagged image: must survive.
+        let sig = r#"{"config":{"digest":"sha256:cfg_sig"},"subject":{"digest":"sha256:m_image"}}"#
+            .as_bytes();
+        // Attached to a manifest that is itself unreachable: must not survive.
+        let orphan_sig =
+            r#"{"config":{"digest":"sha256:cfg_orphan_sig"},"subject":{"digest":"sha256:m_gone"}}"#
+                .as_bytes();
+
+        for (digest, json) in [
+            ("sha256:m_image", image),
+            ("sha256:m_sig", sig),
+            ("sha256:m_orphan_sig", orphan_sig),
+        ] {
+            sqlx::query!(
+                r#"INSERT INTO manifest (digest, blob, json) VALUES ($1, $2, jsonb($2))"#,
+                digest,
+                json
+            )
+            .execute(state.services.repos().db_rw())
+            .await
+            .unwrap();
+        }
+
+        sqlx::query!(
+            r#"
+            INSERT INTO tag (tag, repo, manifest_digest)
+            VALUES ('latest', 'testrepo', 'sha256:m_image')
+            "#
+        )
+        .execute(state.services.repos().db_rw())
+        .await
+        .unwrap();
+
+        let deleted = state.services.gc.delete_untagged_manifests().await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let mut manifests = sqlx::query_scalar!(r#"SELECT digest FROM manifest"#)
+            .fetch_all(state.services.repos().db_ro())
+            .await
+            .unwrap();
+        manifests.sort();
+        assert_eq!(
+            manifests,
+            vec!["sha256:m_image", "sha256:m_sig"],
+            "a referrer of a tagged image was collected"
+        );
+    }
+
+    /// A referrer must outlive its subject regardless of *why* the subject is kept. Rooting
+    /// reachability at tags alone protects only referrers of tagged images, which drops the
+    /// signature of an image pinned by digest — build, push by digest, `cosign sign`, never tag.
+    /// The signature dies immediately rather than after the retention window, because artifacts
+    /// share one empty config blob whose age says nothing about when the signature was pushed.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_delete_untagged_manifests_keeps_referrers_of_untagged_warm_image() {
+        let dir = test_temp_dir!();
+        let (state, _router) = test_utilities::trow_router(|_| {}, &dir).await;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO blob (digest, size, last_accessed)
+            VALUES ('sha256:cfg_pinned', 10, unixepoch('now')),
+                   ('sha256:cfg_empty', 2, unixepoch('now', '-30 days'))
+            "#
+        )
+        .execute(state.services.repos().db_rw())
+        .await
+        .unwrap();
+
+        // Untagged, but freshly pushed: the age gate is what keeps it.
+        let pinned = r#"{"config":{"digest":"sha256:cfg_pinned"}}"#.as_bytes();
+        // Its signature, sharing the long-cold empty config blob every OCI artifact uses.
+        let sig =
+            r#"{"config":{"digest":"sha256:cfg_empty"},"subject":{"digest":"sha256:m_pinned"}}"#
+                .as_bytes();
+
+        for (digest, json) in [("sha256:m_pinned", pinned), ("sha256:m_pinned_sig", sig)] {
+            sqlx::query!(
+                r#"INSERT INTO manifest (digest, blob, json) VALUES ($1, $2, jsonb($2))"#,
+                digest,
+                json
+            )
+            .execute(state.services.repos().db_rw())
+            .await
+            .unwrap();
+        }
+
+        let deleted = state.services.gc.delete_untagged_manifests().await.unwrap();
+        assert_eq!(deleted, 0);
+
+        let mut manifests = sqlx::query_scalar!(r#"SELECT digest FROM manifest"#)
+            .fetch_all(state.services.repos().db_ro())
+            .await
+            .unwrap();
+        manifests.sort();
+        assert_eq!(
+            manifests,
+            vec!["sha256:m_pinned", "sha256:m_pinned_sig"],
+            "the signature of an untagged but still-live image was collected"
+        );
+    }
+
+    /// Re-pushing a multi-arch tag orphans the previous index. It has no config blob to age, so it
+    /// is only collectable once its children are gone — which takes a second pass.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_delete_untagged_manifests_collects_orphaned_index() {
+        let dir = test_temp_dir!();
+        let (state, _router) = test_utilities::trow_router(|_| {}, &dir).await;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO blob (digest, size, last_accessed)
+            VALUES ('sha256:cfg_old_amd64', 10, strftime('%s', 'now', '-30 days')),
+                   ('sha256:cfg_old_arm64', 10, strftime('%s', 'now', '-30 days')),
+                   ('sha256:cfg_new', 10, strftime('%s', 'now', '-1 hour'))
+            "#
+        )
+        .execute(state.services.repos().db_rw())
+        .await
+        .unwrap();
+
+        let old_amd64 = r#"{"config":{"digest":"sha256:cfg_old_amd64"}}"#.as_bytes();
+        let old_arm64 = r#"{"config":{"digest":"sha256:cfg_old_arm64"}}"#.as_bytes();
+        let old_index =
+            r#"{"manifests":[{"digest":"sha256:m_old_amd64"},{"digest":"sha256:m_old_arm64"}]}"#
+                .as_bytes();
+        let new_child = r#"{"config":{"digest":"sha256:cfg_new"}}"#.as_bytes();
+        let new_index = r#"{"manifests":[{"digest":"sha256:m_new_child"}]}"#.as_bytes();
+
+        for (digest, json) in [
+            ("sha256:m_old_amd64", old_amd64),
+            ("sha256:m_old_arm64", old_arm64),
+            ("sha256:m_old_index", old_index),
+            ("sha256:m_new_child", new_child),
+            ("sha256:m_new_index", new_index),
+        ] {
+            sqlx::query!(
+                r#"INSERT INTO manifest (digest, blob, json) VALUES ($1, $2, jsonb($2))"#,
+                digest,
+                json
+            )
+            .execute(state.services.repos().db_rw())
+            .await
+            .unwrap();
+        }
+
+        // 'latest' was repointed at the new index; the old one is now unreachable.
+        sqlx::query!(
+            r#"
+            INSERT INTO tag (tag, repo, manifest_digest)
+            VALUES ('latest', 'testrepo', 'sha256:m_new_index')
+            "#
+        )
+        .execute(state.services.repos().db_rw())
+        .await
+        .unwrap();
+
+        let deleted = state.services.gc.delete_untagged_manifests().await.unwrap();
+        assert_eq!(deleted, 3, "the orphaned index itself was left behind");
+
+        let mut manifests = sqlx::query_scalar!(r#"SELECT digest FROM manifest"#)
+            .fetch_all(state.services.repos().db_ro())
+            .await
+            .unwrap();
+        manifests.sort();
+        assert_eq!(manifests, vec!["sha256:m_new_child", "sha256:m_new_index"]);
     }
 }
