@@ -69,9 +69,9 @@ mod smoke_test {
     }
 
     /**
-     * Run a simple podman push/pull against the registry.
+     * Run a simple push/pull against the registry.
      *
-     * This assumes podman is installed.
+     * This assumes the container runtime is installed (podman by default, see `runtime()`).
      */
     #[tokio::test]
     #[tracing_test::traced_test]
@@ -85,49 +85,68 @@ mod smoke_test {
         let remote_image = "public.ecr.aws/docker/library/alpine:latest";
         let local_image = format!("127.0.0.1:{}/alpine:trow", trow.port);
 
-        println!("Running podman pull alpine:latest");
-        let mut status = Command::new("podman")
+        let runtime = runtime();
+
+        println!("Running {runtime} pull alpine:latest");
+        let mut status = Command::new(&runtime)
             .args(["pull", remote_image])
             .status()
-            .expect("Failed to call podman pull - prereq for smoke test");
+            .expect("Failed to call container runtime pull - prereq for smoke test");
         assert!(status.success());
 
-        println!("Running podman tag {remote_image} {local_image}");
-        status = Command::new("podman")
+        println!("Running {runtime} tag {remote_image} {local_image}");
+        status = Command::new(&runtime)
             .args(["tag", remote_image, &local_image])
             .status()
-            .expect("Failed to call podman");
+            .expect("Failed to call container runtime");
         assert!(status.success());
 
-        println!("Running podman push {local_image}");
-        status = Command::new("podman")
-            .args(["push", &local_image, "--tls-verify=false"])
+        println!("Running {runtime} push {local_image}");
+        status = Command::new(&runtime)
+            .args(["push", &local_image])
+            .args(tls_verify_args())
             .status()
-            .expect("Failed to call podman");
+            .expect("Failed to call container runtime");
         assert!(status.success());
 
-        println!("Running podman rmi {local_image}");
-        status = Command::new("podman")
+        println!("Running {runtime} rmi {local_image}");
+        status = Command::new(&runtime)
             .args(["rmi", &local_image])
             .status()
-            .expect("Failed to call podman");
+            .expect("Failed to call container runtime");
         assert!(status.success());
 
-        println!("Running podman pull {local_image}");
-        status = Command::new("podman")
-            .args(["pull", &local_image, "--tls-verify=false"])
+        println!("Running {runtime} pull {local_image}");
+        status = Command::new(&runtime)
+            .args(["pull", &local_image])
+            .args(tls_verify_args())
             .status()
-            .expect("Failed to call podman");
+            .expect("Failed to call container runtime");
 
         assert!(status.success());
     }
 
     fn new_command(cmd: &str) -> Command {
         println!("Running: {cmd}");
-        let mut cmd_it = cmd.split(' ');
+        let mut cmd_it = cmd.split(' ').filter(|arg| !arg.is_empty());
         let mut cmd = Command::new(cmd_it.next().unwrap());
         cmd.args(cmd_it);
         cmd
+    }
+
+    /// Container runtime driving the smoke tests, overridable with `TROW_TEST_RUNTIME=docker`.
+    fn runtime() -> String {
+        std::env::var("TROW_TEST_RUNTIME").unwrap_or_else(|_| "podman".to_string())
+    }
+
+    /// `--tls-verify=false` is podman-only. Docker has no equivalent flag and instead treats
+    /// loopback registries as insecure by default, so it needs no argument here.
+    fn tls_verify_args() -> &'static [&'static str] {
+        if runtime() == "docker" {
+            &[]
+        } else {
+            &["--tls-verify=false"]
+        }
     }
 
     #[tokio::test]
@@ -158,22 +177,24 @@ mod smoke_test {
         .await;
 
         let remote_image = "public.ecr.aws/docker/library/alpine:latest";
-        println!("Running podman pull alpine:latest");
-        new_command(&format!("podman pull {remote_image}"))
+        let runtime = runtime();
+        let tls_verify = tls_verify_args().join(" ");
+        println!("Running {runtime} pull alpine:latest");
+        new_command(&format!("{runtime} pull {remote_image}"))
             .status()
-            .expect("Failed to call podman pull alpine:latest - prereq for test");
+            .expect("Failed to call container runtime pull alpine:latest - prereq for test");
         new_command(&format!(
-            "podman tag {remote_image} 127.0.0.1:{}/alpine:latest",
+            "{runtime} tag {remote_image} 127.0.0.1:{}/alpine:latest",
             trow0.port
         ))
         .status()
-        .expect("Failed to call podman tag - prereq for test");
+        .expect("Failed to call container runtime tag - prereq for test");
         new_command(&format!(
-            "podman push 127.0.0.1:{}/alpine:latest --tls-verify=false",
+            "{runtime} push 127.0.0.1:{}/alpine:latest {tls_verify}",
             trow0.port
         ))
         .status()
-        .expect("Failed to call podman push - prereq for test");
+        .expect("Failed to call container runtime push - prereq for test");
         let resp = trow1
             .1
             .clone()
@@ -215,18 +236,20 @@ mod smoke_test {
         .await;
 
         let remote_image = "public.ecr.aws/docker/library/alpine:latest";
-        println!("Running podman pull alpine:latest");
-        new_command(&format!("podman pull {remote_image}"))
+        let runtime = runtime();
+        let tls_verify = tls_verify_args().join(" ");
+        println!("Running {runtime} pull alpine:latest");
+        new_command(&format!("{runtime} pull {remote_image}"))
             .status()
             .unwrap();
         new_command(&format!(
-            "podman tag {remote_image} ipv6-localhost:{}/alpine:latest",
+            "{runtime} tag {remote_image} ipv6-localhost:{}/alpine:latest",
             trow0.port
         ))
         .status()
         .unwrap();
         new_command(&format!(
-            "podman push ipv6-localhost:{}/alpine:latest --tls-verify=false",
+            "{runtime} push ipv6-localhost:{}/alpine:latest {tls_verify}",
             trow0.port
         ))
         .status()
