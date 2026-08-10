@@ -4,6 +4,7 @@
   - [Persisting Data/Images](#persisting-dataimages)
   - [Proxying other registries](#proxying-other-registries)
   - [Validating Webhook](#validating-webhook)
+  - [Garbage Collection](#garbage-collection)
   - [Listing Repositories and Tags](#listing-repositories-and-tags)
   - [Multiplatform Builds](#multiplatform-builds)
   - [Troubleshooting](#troubleshooting)
@@ -166,6 +167,34 @@ Image validation webhook configured:
   Denied prefixes: ["my-trow-domain.trow.io/my-secret-image"]
 Proxy registries not configured
 ```
+
+## Garbage Collection
+
+Trow periodically reclaims space taken by data nothing refers to any more: abandoned uploads,
+blobs no manifest lists, and manifests no tag points at.
+
+That last one needs care. Re-pushing a tag repoints it rather than deleting the old manifest, so
+untagged manifests accumulate one per overwrite, and each keeps its layers pinned. But untagged
+does not mean unused — `docker pull registry/image@sha256:...` still works, and pinning images by
+digest is common under Kubernetes. Trow therefore only collects an untagged manifest once it has
+gone cold, measured by the last time anything fetched its config blob:
+
+```yaml
+# gc.yaml
+garbage_collection:
+  # Default: 7
+  untagged_manifest_retention_days: 30
+```
+
+Raise this if you pin images by digest and roll nodes rarely — a node that already has the image
+cached never re-pulls it, so nothing warms the manifest and the retention window is the only thing
+keeping it alive. `0` is rejected at startup: it reads as "off" but would mean the opposite,
+collecting every untagged manifest on the next pass.
+
+Manifests still reachable from a tag are never collected, and neither are the things hanging off
+them: the per-architecture manifests listed by a tagged index, and OCI referrers (signatures,
+SBOMs, attestations) whose `subject` points at something reachable. Referrers are untagged by
+design, so they are kept for exactly as long as what they are attached to.
 
 ## Listing Repositories and Tags
 

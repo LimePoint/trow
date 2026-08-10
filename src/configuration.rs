@@ -12,6 +12,57 @@ pub struct ConfigFile {
     #[serde(deserialize_with = "de_unwrap_or_default")]
     pub registry_proxies: RegistryProxiesConfig,
     pub image_validation: Option<ImageValidationConfig>,
+    #[serde(default, deserialize_with = "de_unwrap_or_default")]
+    pub garbage_collection: GarbageCollectionConfig,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GarbageCollectionConfig {
+    /// How long an untagged manifest must have gone untouched before it is reclaimed.
+    ///
+    /// Untagged manifests are still pullable by digest, so this is the window in which a
+    /// digest-pinned deployment that never re-pulls (and therefore never warms the manifest's
+    /// config blob) is protected. Raise it if you pin images by digest and roll nodes rarely.
+    ///
+    /// Must be at least 1. `0` is rejected rather than accepted, because it reads as "off" but
+    /// would mean the opposite — collecting every untagged manifest on the next GC pass.
+    #[serde(
+        default = "default_untagged_manifest_retention_days",
+        deserialize_with = "de_retention_days"
+    )]
+    pub untagged_manifest_retention_days: u32,
+}
+
+fn default_untagged_manifest_retention_days() -> u32 {
+    7
+}
+
+fn de_retention_days<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let days = u32::deserialize(d)?;
+    if days == 0 {
+        return Err(serde::de::Error::custom(
+            "untagged_manifest_retention_days must be at least 1: 0 does not disable collection, \
+             it collects every untagged manifest on the next pass",
+        ));
+    }
+    Ok(days)
+}
+
+impl Default for GarbageCollectionConfig {
+    fn default() -> Self {
+        Self {
+            untagged_manifest_retention_days: default_untagged_manifest_retention_days(),
+        }
+    }
+}
+
+impl GarbageCollectionConfig {
+    pub fn untagged_manifest_retention_secs(&self) -> i64 {
+        i64::from(self.untagged_manifest_retention_days) * 86_400
+    }
 }
 
 fn de_unwrap_or_default<'de, T, D>(d: D) -> Result<T, D::Error>
@@ -110,6 +161,46 @@ impl From<Vec<SingleRegistryProxyConfig>> for RegistryProxyConfigs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_garbage_collection_defaults_when_absent() {
+        // Whether the section is missing entirely or present but empty.
+        for json in [
+            r#"{"registry_proxies": null}"#,
+            r#"{"registry_proxies": null, "garbage_collection": {}}"#,
+        ] {
+            let config: ConfigFile = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                config.garbage_collection.untagged_manifest_retention_days, 7,
+                "did not default: {json}"
+            );
+        }
+    }
+
+    /// 0 reads as "off" but would mean "collect every untagged manifest on the next pass", so it
+    /// is rejected rather than quietly obeyed.
+    #[test]
+    fn test_garbage_collection_rejects_zero_retention() {
+        let err = serde_json::from_str::<ConfigFile>(
+            r#"{"registry_proxies": null,
+                "garbage_collection": {"untagged_manifest_retention_days": 0}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must be at least 1"),
+            "unhelpful error: {err}"
+        );
+
+        let config: ConfigFile = serde_json::from_str(
+            r#"{"registry_proxies": null,
+                "garbage_collection": {"untagged_manifest_retention_days": 1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.garbage_collection.untagged_manifest_retention_days,
+            1
+        );
+    }
 
     #[test]
     fn test_registry_proxy_deserialize_path_prefix() {

@@ -136,7 +136,8 @@ impl ManifestRepository {
     /// image, unlike layers which are shared with derived images and stay warm indefinitely. A
     /// client resolving the manifest by digest goes on to fetch the config, which bumps
     /// `last_accessed` — but only when it actually pulls, so a digest-pinned image already cached
-    /// on every node will still go cold. `retention_secs` is how long that is tolerated.
+    /// on every node will still go cold. `retention_secs` is how long that is tolerated, from
+    /// `garbage_collection.untagged_manifest_retention_days`.
     ///
     /// An index has no `$.config` and so can never enter `keep` by age; the second half of the
     /// delete predicate collects one once nothing it lists is left in `manifest`. That needs the

@@ -107,7 +107,11 @@ impl GcService {
     /// `MAX_PASSES` is only a guard against a delete that somehow fails to remove its row.
     pub async fn delete_untagged_manifests(&self) -> Result<u64, Error> {
         const MAX_PASSES: usize = 16;
-        const RETENTION_SECS: i64 = 7 * 86_400;
+        let retention_secs = self
+            .config
+            .config_file
+            .garbage_collection
+            .untagged_manifest_retention_secs();
 
         let mut deleted = 0;
         let mut settled = false;
@@ -115,7 +119,7 @@ impl GcService {
             let pass_deleted = self
                 .repos
                 .manifest
-                .delete_untagged_older_than(RETENTION_SECS)
+                .delete_untagged_older_than(retention_secs)
                 .await?;
             // A pass that deletes nothing is the fixpoint. Checking the *outcome* rather than the
             // pass number keeps a run that happens to finish on the last pass from being reported
@@ -694,5 +698,43 @@ mod tests {
             .unwrap();
         manifests.sort();
         assert_eq!(manifests, vec!["sha256:m_new_child", "sha256:m_new_index"]);
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_delete_untagged_manifests_honours_configured_retention() {
+        let dir = test_temp_dir!();
+        let (state, _router) = test_utilities::trow_router(
+            |cfg| {
+                cfg.config_file
+                    .garbage_collection
+                    .untagged_manifest_retention_days = 30;
+            },
+            &dir,
+        )
+        .await;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO blob (digest, size, last_accessed)
+            VALUES ('sha256:cfg', 10, strftime('%s', 'now', '-10 days'))
+            "#
+        )
+        .execute(state.services.repos().db_rw())
+        .await
+        .unwrap();
+
+        let image = r#"{"config":{"digest":"sha256:cfg"}}"#.as_bytes();
+        sqlx::query!(
+            r#"INSERT INTO manifest (digest, blob, json) VALUES ('sha256:m', $1, jsonb($1))"#,
+            image
+        )
+        .execute(state.services.repos().db_rw())
+        .await
+        .unwrap();
+
+        // 10 days cold, but the configured window is 30.
+        let deleted = state.services.gc.delete_untagged_manifests().await.unwrap();
+        assert_eq!(deleted, 0, "configured retention window was ignored");
     }
 }
